@@ -1,4 +1,5 @@
 <?php
+// DB.php - 数据库连接类
 class DB {
     private static $instance = null;
     private $pdo;

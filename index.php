@@ -1,14 +1,48 @@
 <?php
+// index.php - 主入口
 require_once 'config.php';
 require_once 'DB.php';
 require_once 'StorageFactory.php';
 require_once 'Payment.php';
 require_once 'functions.php';
 
+// ---------- 易支付签名函数 ----------
+/**
+ * 生成签名
+ * @param array $params 参数数组（不含sign）
+ * @param string $key 商户密钥
+ * @return string
+ */
+function epay_sign($params, $key) {
+    ksort($params);
+    $str = '';
+    foreach ($params as $k => $v) {
+        if ($v === '' || $v === null) continue;
+        $str .= $k . '=' . $v . '&';
+    }
+    $str = rtrim($str, '&');
+    $str .= $key;
+    return md5($str);
+}
+
+/**
+ * 验证回调签名
+ * @param array $data 回调数据（含sign）
+ * @param string $key 商户密钥
+ * @return bool
+ */
+function epay_verify_sign($data, $key) {
+    if (!isset($data['sign'])) return false;
+    $sign = $data['sign'];
+    unset($data['sign']);
+    $calcSign = epay_sign($data, $key);
+    return $calcSign === $sign;
+}
+// ---------------------------------
+
 $pdo = DB::getInstance()->getPDO();
 $action = $_GET['action'] ?? 'home';
 
-// 用户认证检查（部分页面无需登录）
 $currentUser = null;
 if (isset($_SESSION['user_id'])) {
     $stmt = $pdo->prepare("SELECT * FROM users WHERE id = ?");
@@ -16,14 +50,30 @@ if (isset($_SESSION['user_id'])) {
     $currentUser = $stmt->fetch(PDO::FETCH_ASSOC);
 }
 
-// 路由分发
-switch ($action) {
-    case 'logout':
-        session_destroy();
-        header('Location: index.php');
-        exit;
+// 流式播放处理
+if ($action == 'stream') {
+    $id = $_GET['id'] ?? 0;
+    $stmt = $pdo->prepare("SELECT * FROM musics WHERE id = ?");
+    $stmt->execute([$id]);
+    $music = $stmt->fetch(PDO::FETCH_ASSOC);
+    if ($music && $music['storage_driver'] == 'onedrive') {
+        $onedrive = new OneDriveStorage();
+        $url = $onedrive->getDownloadUrl($music['storage_path']);
+        if ($url) {
+            header('Location: ' . $url);
+            exit;
+        }
+    }
+    die('无法获取播放链接');
+}
 
-    case 'login':
+switch ($action) {
+    case 'logout': 
+        session_destroy(); 
+        header('Location: index.php'); 
+        exit;
+        
+    case 'login': 
         if ($_POST) {
             $username = $_POST['username'] ?? '';
             $password = $_POST['password'] ?? '';
@@ -34,201 +84,173 @@ switch ($action) {
                 $_SESSION['user_id'] = $user['id'];
                 header('Location: index.php');
                 exit;
-            } else {
-                $error = '用户名或密码错误';
-            }
+            } else $error = '用户名或密码错误';
         }
         include 'templates/login.php';
         break;
-
+        
     case 'register':
         if ($_POST) {
-            $username = $_POST['username'] ?? '';
-            $password = $_POST['password'] ?? '';
-            $email = $_POST['email'] ?? '';
-            if (strlen($password) < 6) {
-                $error = '密码至少6位';
-            } else {
-                $hash = password_hash($password, PASSWORD_DEFAULT);
-                try {
-                    $stmt = $pdo->prepare("INSERT INTO users (username, password, email) VALUES (?, ?, ?)");
-                    $stmt->execute([$username, $hash, $email]);
-                    $_SESSION['user_id'] = $pdo->lastInsertId();
-                    header('Location: index.php');
-                    exit;
-                } catch (PDOException $e) {
-                    $error = '用户名已存在';
-                }
-            }
+            $username = $_POST['username'];
+            $password = password_hash($_POST['password'], PASSWORD_DEFAULT);
+            $email = $_POST['email'];
+            try {
+                $stmt = $pdo->prepare("INSERT INTO users (username, password, email) VALUES (?,?,?)");
+                $stmt->execute([$username, $password, $email]);
+                $_SESSION['user_id'] = $pdo->lastInsertId();
+                header('Location: index.php');
+                exit;
+            } catch (PDOException $e) { $error = '用户名已存在'; }
         }
         include 'templates/register.php';
         break;
-
+        
     case 'upload_form':
-        if (!$currentUser) {
-            header('Location: index.php?action=login');
-            exit;
-        }
+        if (!$currentUser) { header('Location: index.php?action=login'); exit; }
         include 'templates/upload_form.php';
         break;
-
+        
     case 'upload':
-        if (!$currentUser) {
-            header('Location: index.php?action=login');
-            exit;
-        }
-        // 检查上传限制
+        if (!$currentUser) die('请登录');
         $uploadCount = $currentUser['upload_count'];
-        $isSub = isSubscribed($currentUser);
-        if (!$isSub && $uploadCount >= FREE_UPLOAD_LIMIT) {
-            die('免费用户最多上传 ' . FREE_UPLOAD_LIMIT . ' 首音乐，请订阅会员');
-        }
+        if (!isSubscribed($currentUser) && $uploadCount >= FREE_UPLOAD_LIMIT) die('免费用户最多上传5首');
         if ($_FILES['music_file']['error'] === UPLOAD_ERR_OK) {
-            $tmpName = $_FILES['music_file']['tmp_name'];
-            $originalName = $_FILES['music_file']['name'];
-            $ext = pathinfo($originalName, PATHINFO_EXTENSION);
-            if (!in_array(strtolower($ext), ['mp3', 'wav', 'ogg', 'm4a'])) {
-                die('只支持 mp3, wav, ogg, m4a 格式');
-            }
-            // 生成唯一文件名
+            $ext = pathinfo($_FILES['music_file']['name'], PATHINFO_EXTENSION);
+            if (!in_array(strtolower($ext), ['mp3','wav','ogg','m4a'])) die('格式不支持');
             $newFileName = uniqid() . '.' . $ext;
             $remotePath = 'music/' . $newFileName;
-
+            $storage = StorageFactory::create();
+            $result = $storage->upload($_FILES['music_file']['tmp_name'], $remotePath);
+            $stmt = $pdo->prepare("INSERT INTO musics (user_id, title, file_name, file_url, storage_driver, storage_path, size) VALUES (?,?,?,?,?,?,?)");
+            $title = $_POST['title'] ?? pathinfo($_FILES['music_file']['name'], PATHINFO_FILENAME);
+            $stmt->execute([$currentUser['id'], $title, $newFileName, $result['url'] ?? '', $result['driver'], $result['path'], $_FILES['music_file']['size']]);
+            $pdo->prepare("UPDATE users SET upload_count = upload_count+1 WHERE id=?")->execute([$currentUser['id']]);
+            header('Location: index.php?action=my_music&msg=uploaded');
+        } else die('上传失败');
+        break;
+        
+    case 'delete_music':
+        if (!$currentUser) die('请登录');
+        $musicId = $_GET['id'];
+        $stmt = $pdo->prepare("SELECT * FROM musics WHERE id=? AND user_id=?");
+        $stmt->execute([$musicId, $currentUser['id']]);
+        $music = $stmt->fetch();
+        if ($music) {
             try {
                 $storage = StorageFactory::create();
-                $rawUrl = $storage->upload($tmpName, $remotePath);
-                // 保存到数据库
-                $stmt = $pdo->prepare("INSERT INTO musics (user_id, title, file_name, file_url, size) VALUES (?, ?, ?, ?, ?)");
-                $title = $_POST['title'] ?? pathinfo($originalName, PATHINFO_FILENAME);
-                $size = $_FILES['music_file']['size'];
-                $stmt->execute([$currentUser['id'], $title, $newFileName, $rawUrl, $size]);
-                // 更新用户上传计数
-                $pdo->prepare("UPDATE users SET upload_count = upload_count + 1 WHERE id = ?")->execute([$currentUser['id']]);
-                header('Location: index.php?action=my_music&msg=uploaded');
-                exit;
-            } catch (Exception $e) {
-                die('上传失败：' . $e->getMessage());
-            }
-        } else {
-            die('文件上传错误');
+                $storage->delete($music['storage_path']);
+            } catch(Exception $e) {}
+            $pdo->prepare("DELETE FROM musics WHERE id=?")->execute([$musicId]);
+            $pdo->prepare("UPDATE users SET upload_count = upload_count-1 WHERE id=?")->execute([$currentUser['id']]);
         }
+        header('Location: index.php?action=my_music');
         break;
-
-    case 'delete_music':
-        if (!$currentUser) die('请先登录');
-        $musicId = $_GET['id'] ?? 0;
-        $stmt = $pdo->prepare("SELECT * FROM musics WHERE id = ? AND user_id = ?");
-        $stmt->execute([$musicId, $currentUser['id']]);
-        $music = $stmt->fetch(PDO::FETCH_ASSOC);
-        if (!$music) die('音乐不存在或无权限');
-        // 删除远程文件（可选，可能失败但不影响本地记录删除）
-        try {
-            $storage = StorageFactory::create();
-            $remotePath = 'music/' . $music['file_name'];
-            $storage->delete($remotePath);
-        } catch (Exception $e) {
-            // 记录日志，继续删除数据库记录
-        }
-        $pdo->prepare("DELETE FROM musics WHERE id = ?")->execute([$musicId]);
-        $pdo->prepare("UPDATE users SET upload_count = upload_count - 1 WHERE id = ?")->execute([$currentUser['id']]);
-        header('Location: index.php?action=my_music&msg=deleted');
-        exit;
-
+        
     case 'my_music':
-        if (!$currentUser) {
-            header('Location: index.php?action=login');
-            exit;
-        }
-        $stmt = $pdo->prepare("SELECT * FROM musics WHERE user_id = ? ORDER BY created_at DESC");
+        if (!$currentUser) { header('Location: index.php?action=login'); exit; }
+        $stmt = $pdo->prepare("SELECT * FROM musics WHERE user_id=? ORDER BY created_at DESC");
         $stmt->execute([$currentUser['id']]);
-        $myMusics = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $myMusics = $stmt->fetchAll();
         include 'templates/my_music.php';
         break;
-
+        
     case 'subscribe':
-        if (!$currentUser) {
-            header('Location: index.php?action=login');
-            exit;
-        }
-        global $plans;
+        if (!$currentUser) { header('Location: index.php?action=login'); exit; }
         if ($_POST && isset($_POST['plan'])) {
             $plan = $_POST['plan'];
-            if (!isset($plans[$plan])) die('无效套餐');
+            global $plans;
             $amount = $plans[$plan]['price'];
-            $orderNo = date('YmdHis') . rand(1000, 9999);
-            // 保存订单
-            $stmt = $pdo->prepare("INSERT INTO orders (order_no, user_id, plan, amount, status) VALUES (?, ?, ?, ?, 0)");
+            $orderNo = date('YmdHis') . rand(1000,9999);
+            $stmt = $pdo->prepare("INSERT INTO orders (order_no, user_id, plan, amount, status) VALUES (?,?,?,?,0)");
             $stmt->execute([$orderNo, $currentUser['id'], $plan, $amount]);
-            // 跳转到易支付
             $payUrl = Payment::createOrder($orderNo, $amount, $plans[$plan]['name']);
             header('Location: ' . $payUrl);
             exit;
         }
         include 'templates/subscribe.php';
         break;
-
+        
     case 'pay_callback':
-        // 易支付异步通知
-        $data = $_POST;
-        if (Payment::verifyCallback($data)) {
-            $orderNo = $data['out_trade_no'];
-            $pdo->beginTransaction();
-            try {
-                $stmt = $pdo->prepare("SELECT * FROM orders WHERE order_no = ? FOR UPDATE");
-                $stmt->execute([$orderNo]);
-                $order = $stmt->fetch(PDO::FETCH_ASSOC);
-                if ($order && $order['status'] == 0) {
-                    // 更新订单状态
-                    $pdo->prepare("UPDATE orders SET status = 1, pay_time = NOW() WHERE id = ?")->execute([$order['id']]);
-                    // 增加用户订阅天数
-                    global $plans;
-                    $days = $plans[$order['plan']]['days'];
-                    $user = getUserById($order['user_id']);
-                    $currentExpire = $user['subscribe_expire'];
-                    if ($currentExpire && strtotime($currentExpire) > time()) {
-                        $newExpire = date('Y-m-d H:i:s', strtotime($currentExpire . " + $days days"));
-                    } else {
-                        $newExpire = date('Y-m-d H:i:s', time() + $days * 86400);
-                    }
-                    $pdo->prepare("UPDATE users SET subscribe_expire = ? WHERE id = ?")->execute([$newExpire, $order['user_id']]);
-                }
+        // 使用易支付签名验证（完整回调处理）
+        if (empty($_POST)) {
+            die('fail');
+        }
+        
+        // 从配置文件获取商户密钥（需要在config.php中定义EPAY_KEY）
+        $epayKey = defined('EPAY_KEY') ? EPAY_KEY : '';
+        if (!$epayKey) {
+            error_log('EPAY_KEY未配置');
+            die('fail');
+        }
+        
+        // 验证签名
+        if (!epay_verify_sign($_POST, $epayKey)) {
+            error_log('签名验证失败: ' . json_encode($_POST));
+            die('fail');
+        }
+        
+        $orderNo = $_POST['out_trade_no'];
+        $tradeNo = $_POST['trade_no'];
+        $totalFee = $_POST['total_fee'];
+        $status = $_POST['trade_status'];
+        
+        // 只处理已支付的订单
+        if ($status !== 'TRADE_SUCCESS') {
+            echo 'success';  // 其他状态也返回success，避免重复通知
+            exit;
+        }
+        
+        $pdo->beginTransaction();
+        try {
+            // 锁定订单行
+            $stmt = $pdo->prepare("SELECT * FROM orders WHERE order_no=? FOR UPDATE");
+            $stmt->execute([$orderNo]);
+            $order = $stmt->fetch();
+            
+            if ($order && $order['status'] == 0) {
+                // 更新订单状态
+                $updateOrder = $pdo->prepare("UPDATE orders SET status=1, pay_time=NOW(), transaction_id=? WHERE id=?");
+                $updateOrder->execute([$tradeNo, $order['id']]);
+                
+                // 更新用户订阅时长
+                global $plans;
+                $days = isset($plans[$order['plan']]['days']) ? $plans[$order['plan']]['days'] : 30;
+                updateUserSubscribe($order['user_id'], $days);
+                
+                // 在 $pdo->commit(); 之前添加
+// 发送邮件通知
+$user = getUserById($order['user_id']);
+if ($user && !empty($user['email'])) {
+    $planName = $plans[$order['plan']]['name'] ?? $order['plan'];
+    $newExpire = $user['subscribe_expire']; // 已经更新过
+    send_subscription_notification($order['user_id'], $planName, $newExpire);
+}
+
                 $pdo->commit();
                 echo 'success';
-            } catch (Exception $e) {
+            } else {
                 $pdo->rollBack();
-                echo 'fail';
+                echo 'success'; // 已处理过的订单也返回success
             }
-        } else {
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            error_log('回调处理异常: ' . $e->getMessage());
             echo 'fail';
         }
         exit;
-
+        
     case 'subscribe_result':
-        // 同步返回页面
-        if (isset($_GET['out_trade_no'])) {
-            $orderNo = $_GET['out_trade_no'];
-            $stmt = $pdo->prepare("SELECT status FROM orders WHERE order_no = ?");
-            $stmt->execute([$orderNo]);
-            $order = $stmt->fetch(PDO::FETCH_ASSOC);
-            if ($order && $order['status'] == 1) {
-                echo '<script>alert("订阅成功！");location.href="index.php?action=my_music";</script>';
-            } else {
-                echo '<script>alert("支付未完成，请稍后重试");location.href="index.php?action=subscribe";</script>';
-            }
-        } else {
-            header('Location: index.php');
-        }
+        $orderNo = $_GET['out_trade_no'] ?? '';
+        $stmt = $pdo->prepare("SELECT status FROM orders WHERE order_no=?");
+        $stmt->execute([$orderNo]);
+        $order = $stmt->fetch();
+        echo '<script>alert("'.($order && $order['status']==1 ? '订阅成功' : '支付未完成').'");location.href="index.php?action=my_music";</script>';
         break;
-
+        
     case 'home':
     default:
-        // 获取所有音乐（公开播放列表）
-        $stmt = $pdo->query("SELECT m.*, u.username FROM musics m LEFT JOIN users u ON m.user_id = u.id ORDER BY m.created_at DESC");
-        $musics = $stmt->fetchAll(PDO::FETCH_ASSOC);
-        // 应用加速地址
-        foreach ($musics as &$music) {
-            $music['file_url_acc'] = getAcceleratedUrl($music['file_url']);
-        }
+        $stmt = $pdo->query("SELECT m.*, u.username FROM musics m LEFT JOIN users u ON m.user_id=u.id ORDER BY m.created_at DESC");
+        $musics = $stmt->fetchAll();
         include 'templates/home.php';
         break;
 }
